@@ -1,0 +1,1 @@
+# Venkata-Krithik-Edge-Optimized-Digit-Classification-Model-for-EFM32-Deployment
