@@ -1,0 +1,574 @@
+Parameter Pruning and Quantization of Image Classification Network
+This assignment shows how to prune the parameters of a trained neural network by using structured pruning.
+In many applications where you use transfer learning to retrain an image classification network for a new task or where you train a new network from scratch, you do not know the optimal network architecture, and the network can be overparameterized. An overparameterized network has redundant connections. Pruning identifies redundant connections that you can remove without affecting the network accuracy.
+This example shows how to:
+Train a simple digit classification convolutional neural network
+Perform post-training, iterative, structured pruning without the need for training data
+Evaluate the impact of different pruning ratios on classification accuracy
+Evaluate the impact of quantization on the classification accuracy of the pruned network
+This example uses a simple convolutional neural network to classify user-written digits from 0 to 9. For more information on setting up the data used for training and validation, see Create Simple Deep Learning Network for Classification. 
+Structured pruning eliminates connections by removing entire filters/channels from the network. Structured pruning in combination with quantization can improve the inference speed and reduce the memory footprint of a network. For an example of structured pruning, see Prune Image Classification Network Using Taylor Scores.
+Part 1. Train the digits Network
+Load the training and validation data. Train a convolutional neural network for the classification task. 
+[imdsTrain, imdsValidation] = loadDigitDataset;
+net = trainDigitDataNetwork(imdsTrain, imdsValidation);
+trueLabels = imdsValidation.Labels;
+classes = categories(trueLabels);
+Create a minibatchqueue object containing the validation data. Set executionEnvironment to auto to evaluate the network on a GPU, if one is available. By default, the minibatchqueue object converts each output to a gpuArray if a GPU is available. Using a GPU requires Parallel Computing Toolbox™ and a supported GPU device. For information on supported devices, see GPU Support by Release.
+executionEnvironment = "auto";
+miniBatchSize = 128;
+imdsValidation.ReadSize = miniBatchSize;
+mbqValidation = minibatchqueue(imdsValidation,1,...
+    'MiniBatchSize',miniBatchSize,...
+    'MiniBatchFormat','SSCB',...
+    'MiniBatchFcn',@preprocessMiniBatch,...
+    'OutputEnvironment',executionEnvironment);
+Convert to dlnetwork Object
+Convert the network to a layer graph and remove the layers used for classification using removeLayers. This allows us to create a custom cost function and evaluate the gradients with respect to the cost function to calculate the parameter score.
+lgraph = layerGraph(net.Layers);
+lgraph = removeLayers(lgraph,["softmax","classoutput"]);
+dlnetog = dlnetwork(lgraph);
+Use analyzeNetwork to analyze the network architecture and learnable parameters. 
+analyzeNetwork(dlnetog) % you can comment this out after you run it once (it's for visualization purposes)
+Evaluate the accuracy of the network.
+accuracyOriginalNet = evaluateAccuracy(dlnetog,mbqValidation,classes,trueLabels)
+Load Digits Data set Function
+The loadDigitDataset function loads the Digits data set and splits the data into training and validation data.
+function [imdsTrain, imdsValidation] = loadDigitDataset()
+digitDatasetPath = fullfile(matlabroot,'toolbox','nnet','nndemos', ...
+    'nndatasets','DigitDataset');
+imds = imageDatastore(digitDatasetPath, ...
+    'IncludeSubfolders',true,'LabelSource','foldernames');
+[imdsTrain, imdsValidation] = splitEachLabel(imds,0.75,"randomized");
+end
+Train Digit Recognition Network Function
+The trainDigitDataNetwork function trains a convolutional neural network to classify digits in grayscale images.
+function net = trainDigitDataNetwork(imdsTrain,imdsValidation)
+layers = [
+    imageInputLayer([28 28 1],"Normalization","rescale-zero-one")
+    % ConvBlock 1 (no need to change this)
+    convolution2dLayer(3,8,'Padding','same')
+    batchNormalizationLayer
+    reluLayer
+    maxPooling2dLayer(2,'Stride',2)
+    
+    % ConvBlock 2 (no need to change this)
+    convolution2dLayer(3,16,'Padding','same')
+    batchNormalizationLayer
+    reluLayer
+    maxPooling2dLayer(2,'Stride',2)
+
+    % ConvBlock 3 (no need to change this)
+    convolution2dLayer(3,32,'Padding','same')
+    reluLayer
+    
+    % OutputBlock (no need to change this)
+    fullyConnectedLayer(10)
+    softmaxLayer
+    classificationLayer];
+
+% Specify the training options
+options = trainingOptions('sgdm', ...
+    'InitialLearnRate',0.01, ...
+    'MaxEpochs',10, ...
+    'Shuffle','every-epoch', ...
+    'ValidationData',imdsValidation, ...
+    'ValidationFrequency',30, ...
+    'Verbose',false, ...
+    'Plots','none',"ExecutionEnvironment","auto");
+
+% Train network
+net = trainNetwork(imdsTrain,layers,options);
+
+% saves the 'net' model as 'digitsNet.mat'
+save('digitsNet.mat','net')
+end
+Mini Batch Preprocessing Function
+The preprocessMiniBatch function preprocesses a mini-batch of predictors by extracting the image data from the input cell array and concatenate into a numeric array. For grayscale input, concatenating the data over the fourth dimension adds a third dimension to each image to use as a singleton channel dimension.
+function X = preprocessMiniBatch(XCell)
+% Extract image data from cell and concatenate.
+X = cat(4,XCell{:});
+end
+Model Accuracy Function
+Evaluate the classification accuracy of the dlnetwork. Accuracy is the percentage of labels correctly classified by the network.
+function accuracy = evaluateAccuracy(dlnet,mbqValidation,classes,trueLabels)
+YPred = modelPredictions(dlnet,mbqValidation,classes);
+accuracy = mean(YPred == trueLabels);
+end
+
+Model Predictions Function
+The modelPredictions function takes as input a dlnetwork object dlnet, a minibatchqueue of input data mbq, and the network classes, and computes the model predictions by iterating over all data in the minibatchqueue object. The function uses the onehotdecode function to find the predicted class with the highest score.
+function predictions = modelPredictions(dlnet,mbq,classes)
+predictions = [];
+while hasdata(mbq)
+    dlXTest = next(mbq);
+    dlYPred = softmax(predict(dlnet,dlXTest));
+    YPred = onehotdecode(dlYPred,classes,1)';
+    predictions = [predictions; YPred];
+end
+reset(mbq)
+end
+
+Part 2. Neural Network Pruning
+The goal of neural network pruning is to identify and remove unimportant connections to reduce the size of the network without affecting network accuracy. In the following figure, on the left, the network has connections that map each neuron to the neuron of the next layer. After pruning, the network has fewer connections than the original network.
+
+A pruning algorithm assigns a score to each parameter in the network. The score ranks the importance of each connection in the network. You can use one of two pruning approaches to achieve a target sparsity:
+One-shot pruning - Remove a specified percentage of connections based on their score in one step. This method is prone to layer collapse when you specify a high sparsity value.
+Iterative pruning - Achieve the target sparsity in a series of iterative steps. You can use this method when evaluated scores are sensitive to network structure. Scores are reevaluated at every iteration, so using a series of steps allows the network to move toward sparsity incrementally.
+This example uses the iterative pruning method to achieve a target sparsity.
+Iterative Pruning  
+
+                                                                                          
+The layers with learnable parameters are computed below.
+numTotalParamsOG = sum(cellfun(@numel,dlnetog.Learnables.Value))
+
+numNonZeroPerParamOG = cellfun(@(w)nnz(extractdata(w)),dlnetog.Learnables.Value)
+
+Channel/Filter Pruning Loop
+For each iteration, the custom pruning loop in this example performs the following steps:
+Calculate the score (in this case the L1 norm) for each channel.
+Rank the scores for all channels in the network based on the selected pruning algorithm.
+Determine the threshold for removing connections with the lowest scores.
+Prune the channels/filters and reinitialize a new layers without the pruned weight
+Magnitude (L1 Norm) Pruning
+% load the trained model
+load('digitsNet.mat','net')
+
+% Find convolution layers
+convIndices = findConvLayers(net.Layers);
+
+% Find all BatchNorm layer indices
+bnIndices = findBatchNormLayers(net.Layers);
+
+% Find final FC layer index
+fcIndex = findFCLayers(net.Layers);
+
+% Set pruning hyperparameters
+prune_ratio = 0.10;  % Prune 10% per iteration
+prune_iterations = int32(1/prune_ratio)-1; % Stop at 1 before pruning to 0
+prune_step = 0; % counter
+
+% TODO: declare variables for:
+% prunedChannelsPerLayer (changes per pruning step) Keep track of this in the pruning loop for generating figures later
+% numOutChannelsPerLayer (this is the orignal network) 
+%prunedChannelsPerLayer = zeros(prune_iterations, length(convIndices));  %(changes per pruning step) Keep track of this in the pruning loop for generating figures later
+%numOutChannelsPerLayer = zeros(1, length(convIndices)); %(this is the orignal network) 
+prunedChannelsPerLayer = zeros(6, prune_iterations); 
+numOutChannelsPerLayer = zeros(6, 1); 
+j = 1;
+for i = 1:numel(net.Layers)
+    iterLay = net.Layers(i);
+    if isa(iterLay, 'nnet.cnn.layer.Convolution2DLayer')
+        numOutChannelsPerLayer(j) = size(iterLay.Weights, 4);
+        j = j + 1;
+    elseif isa(iterLay, 'nnet.cnn.layer.FullyConnectedLayer')
+        numOutChannelsPerLayer(j) = iterLay.OutputSize;
+        j = j + 1;
+    elseif isa(iterLay, 'nnet.cnn.layer.BatchNormalizationLayer')
+        numOutChannelsPerLayer(j) = iterLay.NumChannels;
+        j = j + 1;
+    end
+end
+% Store pruned filter/channel indices per iteration
+prunedIndices = cell(prune_iterations, 1);
+
+% Store accuracy results
+prunedAccuracies = zeros(prune_iterations, 1);
+
+options = trainingOptions('sgdm', ...
+    'InitialLearnRate',0.01, ...
+    'MaxEpochs',10, ...
+    'Shuffle','every-epoch', ...
+    'ValidationData',imdsValidation, ...
+    'ValidationFrequency',30, ...
+    'Verbose',false, ...
+    'Plots','none',"ExecutionEnvironment","auto");
+
+iter=1;
+% original_numFilters = zeros(1, length(convIndices));
+% for i = 1:length(convIndices)
+%     original_numFilters(i) = net.Layers(convIndices(i)).NumFilters;
+% end
+netPruned = net;
+% Iteratively prune
+while true
+    % Get all convolution layer weights
+    [convWeights, numFilters] = getConvWeights(netPruned, convIndices);
+    
+    % Compute L1 norm of each filter <-- this is the pruning score metric
+    % can be changed to a different one as well
+    pruneFilters = computeL1Pruning(convWeights, prune_ratio);
+    
+    % Check if we reached the pruning limit
+    if iter-1 >= prune_iterations
+        break;
+    end
+
+    % TODO: Modify network by pruning identified filters
+    netPruned = pruneNetwork(netPruned, convIndices, bnIndices, fcIndex, pruneFilters);
+
+    % TODO: Convert to lgraph for training
+    lgraphPruned = layerGraph(netPruned.Layers);
+
+    % TODO: Retrain the network after pruning
+     options = trainingOptions('sgdm', ...
+    'InitialLearnRate',0.01, ...
+    'MaxEpochs',10, ...
+    'Shuffle','every-epoch', ...
+    'ValidationData',imdsValidation, ...
+    'ValidationFrequency',30, ...
+    'Verbose',false, ...
+    'Plots','none',"ExecutionEnvironment","auto");
+    netPruned = trainNetwork(imdsTrain, lgraphPruned, options);
+
+    % TODO: Evaluate pruned model
+    % predLabels = classify(net, imdsValidation);
+    % trueLabels = imdsValidation.Labels;         
+    % prunedAccuracies(iter) = mean(predLabels == trueLabels);
+    lgraphPruned = layerGraph(netPruned.Layers);
+    lgraphPruned = removeLayers(lgraphPruned,["softmax","classoutput"]);
+    dlnet = dlnetwork(lgraphPruned);
+    prunedAccuracy = evaluateAccuracy(dlnet,mbqValidation,classes,trueLabels);
+   
+    % TODO: Evaluate and store accuracy per iteration in prunedAccuracies
+    
+    % current_numFilters = zeros(1, length(convIndices));
+    % for i = 1:length(convIndices)
+    %     current_numFilters(i) = net.Layers(convIndices(i)).NumFilters;
+    % end
+    % prunedChannelsPerLayer(iter, :) = original_numFilters - current_numFilters;
+    % numOutChannelsPerLayer = numFilters -  sum(prunedChannelsPerLayer(iter,:), 1);
+    % numTotalParams = 0;
+    % for i = 1:numel(net.Layers)
+    %     if isprop(net.Layers(i), 'Weights') && ~isempty(net.Layers(i).Weights)
+    %         numTotalParams = numTotalParams + numel(net.Layers(i).Weights);
+    %     end
+    %     if isprop(net.Layers(i), 'Bias') && ~isempty(net.Layers(i).Bias)
+    %         numTotalParams = numTotalParams + numel(net.Layers(i).Bias);
+    %     end
+    % end
+    prunedAccuracies(iter) = prunedAccuracy;
+    numTotalParams = sum(cellfun(@numel,dlnet.Learnables.Value));
+    pruned_model_name = sprintf('digitsNet_%.2f_sparsity_params_%d.mat', round(iter*prune_ratio,2), numTotalParams);
+    
+    % Save pruned model
+    save(pruned_model_name,'netPruned')
+
+    % iteration tracking
+    iter=iter+1;
+end
+% print the pruned accuracies
+disp(prunedAccuracies)
+
+Find Convolution, BatchNorm, FC Layers
+function indices = findConvLayers(layers)
+    indices = find(arrayfun(@(l) isa(l, 'nnet.cnn.layer.Convolution2DLayer'), layers));
+end
+
+function indices = findBatchNormLayers(layers)
+    indices = find(arrayfun(@(l) isa(l, 'nnet.cnn.layer.BatchNormalizationLayer'), layers));
+end
+
+function indices = findFCLayers(layers)
+    indices = find(arrayfun(@(l) isa(l, 'nnet.cnn.layer.FullyConnectedLayer'), layers));
+end
+Extract Weights and Filters
+function [weights, numFilters] = getConvWeights(net, convIndices)
+    weights = cell(length(convIndices),1);
+    numFilters = zeros(length(convIndices),1);
+    for i = 1:length(convIndices)
+        layer = net.Layers(convIndices(i));
+        weights{i} = layer.Weights;
+        numFilters(i) = size(layer.Weights,4); % Number of output channels
+    end
+end
+Compute L1 Score for Pruning
+function pruneFilters = computeL1Pruning(weights, prune_ratio)
+    % COMPUTE L1 PRUNING: Prunes filters based on L1 norm
+    norms = cellfun(@(w) sum(abs(w), [1,2,3]), weights, 'UniformOutput', false);
+    thresholds = cellfun(@(n) quantile(n, prune_ratio), norms, 'UniformOutput', false);
+    pruneFilters = cellfun(@(n, t) n <= t, norms, thresholds, 'UniformOutput', false);
+
+    % Ensure at least one filter remains per layer
+    for i = 1:numel(pruneFilters)
+        if all(pruneFilters{i}) % If all filters are pruned
+            [~, minIdx] = min(norms{i}); % Find the filter with the smallest L1 norm
+            pruneFilters{i}(minIdx) = false; % Retain this filter
+        end
+    end
+end
+Prune Network
+function net = pruneNetwork(net, convIndices, bnIndices, fcIndex, pruneFilters)
+    layers = net.Layers;
+
+    for i = 1:length(convIndices)
+        idx = convIndices(i);
+        layer = layers(idx);
+        keepIdx = find(~pruneFilters{i});% Indices of filters to keep
+
+        % Step 1: Create a new convolution layer with pruned filters
+        newLayer = convolution2dLayer(layer.FilterSize, numel(keepIdx), ...
+            'Padding', layer.PaddingSize, ...
+            'Stride', layer.Stride, ...
+            'WeightsInitializer', 'glorot', ...
+            'BiasInitializer', 'zeros');
+
+        % Copy trained weights and biases (ensure correct dimensions)
+        newLayer.Weights = layer.Weights(:,:,:,keepIdx);  % Assign pruned weights
+        newLayer.Bias = layer.Bias(keepIdx);  % Assign pruned biases
+
+        % Retain original layer name
+        newLayer.Name = layer.Name;
+
+        % Replace pruned layer in network
+        layers(idx) = newLayer;
+
+        bnIdx = bnIndices(bnIndices > idx);  % Get indices of BatchNorm layers after the conv layer
+        if ~isempty(bnIdx)
+            % Assume the first BatchNorm layer after the conv layer is the one we need
+            bnIdx = bnIdx(1);
+
+            % Create a new BatchNorm layer to match the pruned filters
+            newBNLayer = batchNormalizationLayer;
+
+            % Copy and update the BatchNorm parameters to reflect the pruned filters
+            newBNLayer.Offset = layers(bnIdx).Offset(keepIdx);
+            newBNLayer.Scale = layers(bnIdx).Scale(keepIdx);
+            newBNLayer.TrainedMean = layers(bnIdx).TrainedMean(keepIdx);
+            newBNLayer.TrainedVariance = layers(bnIdx).TrainedVariance(keepIdx);
+
+            % Retain original layer name
+            newBNLayer.Name = layers(bnIdx).Name;
+
+            % Replace old BatchNorm layer with the new one
+            layers(bnIdx) = newBNLayer;
+        end
+
+        % TODO: Adjust the input channels of the next conv layer due to the previous conv layer's pruning
+        if i < length(convIndices) % Ensure it's not the last Conv layer
+            %TODO: Get the next conv layer
+            % nextConvIdx = ...
+            % nextLayer = ...
+            nextConvIdx = convIndices(i+1);
+            nextLayer = layers(nextConvIdx);
+
+            % Step 1: Create a new convolution layer with pruned filters
+            % HINT: you need to also adjust the parameter 'NumChannels' for the expected input channels
+            %newNumChannels = numel(keepIdx);
+            newnextLayer = convolution2dLayer(layer.FilterSize, nextLayer.NumFilters, ...
+            'NumChannels', numel(keepIdx), ...
+            'Padding', layer.PaddingSize, ...
+            'Stride', layer.Stride, ...
+            'WeightsInitializer', 'glorot', ...
+            'BiasInitializer', 'zeros');
+            %newnextLayer = nextLayer;
+
+            %TODO: Copy trained weights and biases (ensure correct dimensions)
+            % HINT: remember you are modifying the input channels, not output for the next layer!!
+            newnextLayer.Weights = nextLayer.Weights(:,:,keepIdx,:);  % Assign pruned weights
+            newnextLayer.Bias =  nextLayer.Bias; % Assign pruned biases
+            %newnextLayer.NumChannels = newNumChannels;
+            % Retain original layer name
+            newnextLayer.Name = nextLayer.Name;
+
+            % Replace next conv layer in network with new adjusted layer
+            layers(nextConvIdx) = newnextLayer;
+        end        
+    end
+
+    % redefine the FC-layer
+    % since pruning reduces the number of channels, the input shape to the
+    % FC-layer also needs to be changed and redefined
+
+    % Compute the number of inputs to the FC layer
+    numInputs  = computeFCInputSize(layers, convIndices);    
+    numOutputs = 10; % Number of classes
+
+    % Compute the Glorot-initialized weight matrix
+    weights_fc = initializeGlorot(numOutputs, numInputs);
+
+    fc_name = layers(fcIndex).Name; % Preserve name
+    fc_bias = layers(fcIndex).Bias; % Preserve Bias
+    layers(fcIndex) = fullyConnectedLayer(numOutputs);
+    layers(fcIndex).Weights = weights_fc;
+    layers(fcIndex).Bias = fc_bias;
+
+    % Retain original layer name
+    layers(fcIndex).Name = fc_name;
+
+    % Reassemble the network with pruned layers
+    net = assembleNetwork(layers);
+end
+
+Weight Initializations
+function weights = initializeGlorot(numOutputs, numInputs)
+    % Initialize weights using Glorot (Xavier) uniform distribution
+    Z = 2*rand(numOutputs, numInputs,'single') - 1;  % Uniform distribution [-1, 1]
+    bound = sqrt(6 / (numInputs + numOutputs));  % Glorot bound
+    weights = bound * Z;  % Scale weights within the Glorot range
+end
+Compute Final Output Shape
+function numInputs = computeFCInputSize(layers, convIndices)
+    % COMPUTEFCINPUTSIZE Computes the number of inputs to the FC layer
+    % after the last convolutional layer in a given network.
+    %
+    % INPUTS:
+    %   - layers: Array of layers from a deep learning network.
+    %   - convIndices: Indices of convolutional layers in the network.
+    %
+    % OUTPUT:
+    %   - numInputs: Total number of input parameters to the FC layer.
+    
+    % Step 1: Create a dummy input tensor
+    inputSize = layers(1).InputSize;  % Get input size of the network
+    dummyInput = dlarray(zeros(inputSize, 'single'), 'SSCB');  % (Spatial-Spatial-Channel-Batch)
+    
+    % Step 2: Convert to dlnetwork for layer-wise inference
+    lgraph = layerGraph(layers);
+    lgraph = removeLayers(lgraph,["softmax","classoutput","fc"]);
+    dlnet = dlnetwork(lgraph);    
+
+    % Step 3: Extract the last convolutional layer output
+    lastConvIdx = convIndices(end);  % Index of the last Conv layer
+    features = forward(dlnet, dummyInput, 'Outputs', layers(lastConvIdx).Name);
+    
+    % Step 4: Compute the output size
+    [H_final, W_final, C_final, ~] = size(features);  % Spatial and channel dimensions
+    
+    % Step 5: Compute total number of inputs for the FC layer
+    numInputs = H_final * W_final * C_final;
+end
+
+
+
+Plot the original accuracy and pruned accuracies vs prune ratio
+% TODO: Display the pruning progress
+numIterations = 10; 
+targetSparsity = 0.90;
+iterationScheme = linspace(0,targetSparsity,numIterations);
+figure
+plot(100*iterationScheme([1,end]),100*accuracyOriginalNet*[1 1],'*-b','LineWidth',2,"Color","b")
+ylim([0 100])
+xlim(100*iterationScheme([1,end]))
+xlabel("Sparsity (%)")
+ylabel("Accuracy (%)")
+legend("Original Accuracy","Location","southwest")
+title("Pruning Accuracy")    
+grid on
+
+lineAccuracyPruning = animatedline('Color','g','Marker','o','LineWidth',1.5);
+legend("Original Accuracy","Pruning Accuracy","Location","southwest")
+
+%TODO: need to loop through the values and draw
+
+for i = 1:numIterations-1
+    %prunedNetMagnitude = dlnetog;
+    %numPrunedParams = sum(prunedChannelsPerLayer(i, :));
+    %pruningMaskMagnitude{i} = calculateMask(scoresMagnitude,iterationScheme(i));
+    %numPrunedParams = sum(cellfun(@(m)nnz(~extractdata(m)),pruningMaskMagnitude{i}.Value));
+    %sparsity = numPrunedParams/numTotalParamsOG;
+    % sparsity = sum(prunedChannelsPerLayer(i, :)) / sum(numFilters);
+    % prunedNetMagnitude.Learnables = dlupdate(@(W,M)W.*M, prunedNetMagnitude.Learnables, pruningMaskMagnitude{i});
+    % accuracyMagnitude = evaluateAccuracy(prunedNetMagnitude,mbqValidation,classes,trueLabels);
+    % %pruned_accuracy = prunedAccuracies(i);
+    % %addpoints(lineAccuracyPruning,100 * sparsity, 100*accuracyMagnitude);
+    %sparsity = sum(prunedChannelsPerLayer(i, :)) / sum(original_numFilters);
+    sparsity = iterationScheme(i+1)*100;
+    pruned_accuracy = 100*prunedAccuracies(i);
+    addpoints(lineAccuracyPruning, sparsity, pruned_accuracy);
+    drawnow;
+end
+% 
+% numConvLayers = length(convIndices);
+% prunedChannelsTotal = prunedChannelsPerLayer(end, :);
+% remainingChannels = original_numFilters - prunedChannelsTotal;
+% 
+% figure
+% bar([prunedChannelsTotal; remainingChannels]', 'stacked')
+% xlabel("Layer")
+% ylabel("Number of filters")
+% title("Number of filters per layer")
+% xticks(1:numConvLayers)
+% xticklabels({net.Layers(convIndices).Name})
+% legend("Pruned Channels", "Remaining Channels", "Location", "southoutside")
+
+Plot the pruned channel per layer vs number of output channels per layer
+% TODO: Display the pruning statistics
+% TODO: need to compute prunedChannelsPerLayer & numOutChannelsPerLayer for generating the bar-graph in the pruning loop
+prunedChannelsPerLayer1 = zeros(6, 1); 
+j = 1;
+layerNames = strings(6,1);
+for i = 1:numel(netPruned.Layers)
+    iterLay = netPruned.Layers(i);
+    if isa(iterLay, 'nnet.cnn.layer.Convolution2DLayer')
+        prunedChannelsPerLayer1(j) = size(iterLay.Weights, 4);
+        layerNames(j) = iterLay.Name; 
+        j = j + 1;
+    elseif isa(iterLay, 'nnet.cnn.layer.FullyConnectedLayer')
+        prunedChannelsPerLayer1(j) = iterLay.OutputSize;
+        layerNames(j) = iterLay.Name; 
+        j = j + 1;
+    elseif isa(iterLay, 'nnet.cnn.layer.BatchNormalizationLayer')
+        prunedChannelsPerLayer1(j) = iterLay.NumChannels;
+        layerNames(j) = iterLay.Name; 
+        j = j + 1;
+    end
+end
+% 
+% remainingChannelsPerLayer = numOutChannelsPerLayer - prunedChannelsPerLayer1;
+% figure
+% bar([prunedChannelsPerLayer1;remainingChannelsPerLayer]','stacked')
+% xlabel("Layer")
+% ylabel("Number of filters")
+% title("Number of filters per layer")
+% xticks(1:(numel(layerNames)))
+% xticklabels(layerNames)
+% xtickangle(45)
+% legend("Pruned Channels", "Remaining Channels", "Location", "southoutside")
+% set(gca,'TickLabelInterpreter','none')
+remainingChannelsPerLayer = numOutChannelsPerLayer - prunedChannelsPerLayer1;
+prunedChannelsPerLayer1 = prunedChannelsPerLayer1(:)';  
+remainingChannelsPerLayer = remainingChannelsPerLayer(:)';
+
+% Stack and transpose for bar chart
+BarPlot = [prunedChannelsPerLayer1; remainingChannelsPerLayer]';  
+
+figure
+bar(BarPlot, 'stacked')  
+
+xlabel("Layer")
+ylabel("Number of filters")
+title("Number of filters per layer")
+
+xticks(1:numel(layerNames))
+xticklabels(layerNames)
+xtickangle(45)
+
+legend("Pruned Channels", "Remaining Channels", "Location", "southoutside")
+set(gca, 'TickLabelInterpreter', 'none')
+
+Quantize Pruned Network
+Deep neural networks trained in MATLAB use single-precision floating point data types. Even networks that are small require a considerable amount of memory and hardware to perform floating-point arithmetic operations. These restrictions can inhibit deployment of deep learning models that have low computational power and less memory resources. By using a lower precision to store the weights and activations, you can reduce the memory requirements of the network. You can use Deep Learning Toolbox in tandem with the Deep Learning Model Quantization Library support package to reduce the memory footprint of a deep neural network by quantizing the weights, biases, and activations of the convolution layers to 8-bit scaled integer data types.
+Pruning a network impacts the range statistics of parameters and activations at each layer, so the accuracy of the quantized network can change. To explore this difference, quantize the pruned network and use the quantized network to perform inference.
+Split the data into calibration and validation data sets.
+calibrationDataStore = splitEachLabel(imdsTrain,0.1,'randomize');
+validationDataStore = imdsValidation;
+% load the pruned model
+load('digitsNet.mat','net')
+load('digitsNet_0.60_sparsity_params_9947.mat','netPruned')
+Create a dlquantizer object and specify the pruned network as the network to quantize.
+quantObjPrunedNetwork = dlquantizer(netPruned,'ExecutionEnvironment','GPU');
+quantOpts = dlquantizationOptions('Target','host'); %if you don't have a GPU then change 'gpu' to 'host'
+Use the calibrate function to exercise the network with the calibration data and collect range statistics for the weights, biases, and activations at each layer.
+calResults = calibrate(quantObjPrunedNetwork, calibrationDataStore)
+Use the validate function to compare the results of the network before and after quantization using the validation data set.
+valResults = validate(quantObjPrunedNetwork, validationDataStore, quantOpts);
+Examine the MetricResults.Result field of the validation output to see the accuracy of the quantized network.
+valResults.MetricResults.Result
+valResults.Statistics %if you don't have a GPU then this won't display anything
+Save the quantized network and calibration results
+save('quantObjPrunedNetworkCalResults.mat','calResults');
+save('quantObjPrunedNetwork.mat','quantObjPrunedNetwork');
+
+
+
